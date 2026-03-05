@@ -114,11 +114,17 @@ def _test_generate_endpoint(url: str, model: str) -> bool:
         if "api/generate" in url:
             # Ollama-style POST
             payload = json.dumps({"model": model, "prompt": "x", "stream": False})
-        else:
-            # OpenAI-style POST
+        elif "chat" in url:
+            # OpenAI chat-style POST
             payload = json.dumps({
                 "model": model,
                 "messages": [{"role": "user", "content": "x"}]
+            })
+        else:
+            # OpenAI completions-style POST
+            payload = json.dumps({
+                "model": model,
+                "prompt": "x"
             })
 
         result = subprocess.run(
@@ -462,18 +468,28 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
     """Call the AI endpoint with the given prompt."""
     # Detect endpoint type from URL
     is_ollama = "api/generate" in AI_ENDPOINT_URL
+    is_chat = "chat" in AI_ENDPOINT_URL.lower()
 
     if is_ollama:
+        # Ollama format
         payload = {
             "model": AI_MODEL,
             "prompt": prompt,
             "stream": stream
         }
-    else:
-        # OpenAI-compatible format
+    elif is_chat:
+        # OpenAI chat format
         payload = {
             "model": AI_MODEL,
             "messages": [{"role": "user", "content": prompt}],
+            "temperature": TEMPERATURE,
+            "stream": stream
+        }
+    else:
+        # OpenAI completions format (uses "prompt" key)
+        payload = {
+            "model": AI_MODEL,
+            "prompt": prompt,
             "temperature": TEMPERATURE,
             "stream": stream
         }
@@ -491,7 +507,10 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
                                     if is_ollama and "response" in data:
                                         full_response += data["response"]
                                     elif not is_ollama and "choices" in data:
-                                        full_response += data["choices"][0].get("delta", {}).get("content", "")
+                                        if is_chat:
+                                            full_response += data["choices"][0].get("delta", {}).get("content", "")
+                                        else:
+                                            full_response += data["choices"][0].get("text", "")
                                 except (json.JSONDecodeError, KeyError):
                                     pass
                         return full_response
@@ -499,8 +518,10 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
                         data = await response.json()
                         if is_ollama:
                             return data.get("response", "")
-                        else:
+                        elif is_chat:
                             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        else:
+                            return data.get("choices", [{}])[0].get("text", "")
                 else:
                     error = await response.text()
                     log(f"AI endpoint error ({response.status}): {error}", "ERROR")
