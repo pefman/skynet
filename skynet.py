@@ -51,6 +51,11 @@ def _typewrite(text, delay=0.04):
 # Bootstrap config: prompt user if not set via env
 CONFIG_FILE = Path.home() / ".skynet_config"
 
+# Defaults (can be overridden by env vars or interactive bootstrap)
+DEFAULT_ENDPOINT_URL = "http://localhost:11434/api/generate"
+DEFAULT_MODEL = "llama3.2"
+DEFAULT_TEMPERATURE = 0.3
+
 
 def _fetch_models(base_url: str) -> List[str]:
     """Fetch available models from Ollama /api/tags endpoint using curl."""
@@ -69,106 +74,118 @@ def _fetch_models(base_url: str) -> List[str]:
     return []
 
 
-def _get_or_prompt(key: str, default: str, prompt: str, allow_empty: bool = False) -> str:
-    """Get config from env, then file, then prompt user."""
-    # 1. Environment variable takes precedence
-    env_val = os.getenv(key)
-    if env_val:
-        return env_val
-
-    # 2. Check config file
+def _save_config(cfg: dict):
+    """Persist config to file."""
+    if not cfg:
+        return
+    existing = {}
     if CONFIG_FILE.exists():
         try:
-            cfg = json.loads(CONFIG_FILE.read_text())
-            if key in cfg and cfg[key]:
-                return cfg[key]
+            existing = json.loads(CONFIG_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             pass
-
-    # 3. Prompt user (or use default)
-    if default and allow_empty:
-        user_val = input(f"  {prompt} [{default}]  ").strip()
-        return user_val or default
-    else:
-        user_val = input(f"  {prompt}  ").strip()
-        if not user_val and not allow_empty:
-            print("  \033[91mError: Required field cannot be empty\033[0m")
-            sys.exit(1)
-        return user_val or default
+    existing.update(cfg)
+    CONFIG_FILE.write_text(json.dumps(existing, indent=2))
 
 
-def _select_model_interactive(base_url: str, default: str) -> str:
-    """Interactive model selection with fetched list."""
+def _load_config() -> dict:
+    """Load config from file."""
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def run_bootstrap():
+    """Run interactive bootstrap after splash screen."""
+    print("\n\033[93m  BOOTSTRAP CONFIGURATION\033[0m\n")
+
+    # Endpoint URL
+    env_url = os.getenv("AI_ENDPOINT_URL")
+    file_cfg = _load_config()
+    default_url = env_url or file_cfg.get("AI_ENDPOINT_URL", DEFAULT_ENDPOINT_URL)
+
+    print(f"  AI endpoint URL [{default_url}]")
+    url_input = input("    >  ").strip()
+    endpoint_url = url_input or default_url
+    print()
+
+    # Fetch and select model
+    base_url = endpoint_url.replace("/api/generate", "", 1).rstrip("/")
     models = _fetch_models(base_url)
 
-    if not models:
+    env_model = os.getenv("AI_MODEL")
+    if env_model:
+        model = env_model
+        print(f"  Using model from env: {model}\n")
+    elif not models:
+        file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
         print("  \033[90mCould not fetch model list. Enter model name manually.\033[0m")
-        return _get_or_prompt("AI_MODEL", default, "AI model name")
+        print(f"  AI model name [{file_model}]")
+        model_input = input("    >  ").strip()
+        model = model_input or file_model
+    else:
+        print("  \033[93mAvailable models:\033[0m")
+        for i, m in enumerate(models, 1):
+            file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
+            marker = " <-- saved" if m == file_model else ""
+            print(f"    {i}. {m}{marker}")
 
-    print("\n  \033[93mAvailable models:\033[0m")
-    for i, m in enumerate(models, 1):
-        print(f"    {i}. {m}")
+        file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
+        print()
+        choice = input(f"  Select model (1-{len(models)}) or enter name [{file_model}]  ").strip()
 
-    print()
-    choice = input(f"  Select model (1-{len(models)}) or enter name [{default}]  ").strip()
+        if not choice:
+            model = file_model
+        else:
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(models):
+                    model = models[idx]
+                else:
+                    model = choice
+            except ValueError:
+                model = choice
 
-    if not choice:
-        return default
+    # Save config
+    _save_config({
+        "AI_ENDPOINT_URL": endpoint_url,
+        "AI_MODEL": model
+    })
 
-    try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(models):
-            return models[idx]
-    except ValueError:
-        pass
-
-    # User entered a name directly
-    return choice
-
-
-def _save_config(key: str, value: str):
-    """Persist config value to file."""
-    if not value:
-        return
-    cfg = {}
-    if CONFIG_FILE.exists():
-        try:
-            cfg = json.loads(CONFIG_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    cfg[key] = value
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    return endpoint_url, model, DEFAULT_TEMPERATURE
 
 
-# Load configuration (interactive bootstrap on first run)
-AI_ENDPOINT_URL = _get_or_prompt(
-    "AI_ENDPOINT_URL",
-    "http://localhost:11434/api/generate",
-    "AI endpoint URL (Ollama /generate endpoint)"
-)
+# Load configuration (non-interactive, used for restarts)
+def load_config():
+    """Load config respecting env > file > defaults."""
+    # Endpoint
+    if os.getenv("AI_ENDPOINT_URL"):
+        endpoint_url = os.getenv("AI_ENDPOINT_URL")
+    else:
+        file_cfg = _load_config()
+        endpoint_url = file_cfg.get("AI_ENDPOINT_URL", DEFAULT_ENDPOINT_URL)
 
-# Interactive model selection
-if os.getenv("AI_MODEL"):
-    AI_MODEL = os.getenv("AI_MODEL")  # env var takes precedence
-elif CONFIG_FILE.exists():
-    try:
-        cfg = json.loads(CONFIG_FILE.read_text())
-        AI_MODEL = cfg.get("AI_MODEL", "llama3.2")
-    except (json.JSONDecodeError, OSError):
-        AI_MODEL = _select_model_interactive(
-            AI_ENDPOINT_URL.replace("/api/generate", "", 1),
-            "llama3.2"
-        )
-else:
-    AI_MODEL = _select_model_interactive(
-        AI_ENDPOINT_URL.replace("/api/generate", "", 1),
-        "llama3.2"
-    )
+    # Model
+    if os.getenv("AI_MODEL"):
+        model = os.getenv("AI_MODEL")
+    else:
+        file_cfg = _load_config()
+        model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
 
-# Save model choice for future runs
-_save_config("AI_MODEL", AI_MODEL)
+    # Temperature
+    if os.getenv("AI_TEMPERATURE"):
+        temperature = float(os.getenv("AI_TEMPERATURE"))
+    else:
+        temperature = DEFAULT_TEMPERATURE
 
-TEMPERATURE = float(_get_or_prompt("AI_TEMPERATURE", "0.3", "Temperature"))
+    return endpoint_url, model, temperature
+
+
+# Initial load (will be reloaded after splash if first run)
+AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = load_config()
 
 SELF_IMPROVEMENT_ENABLED = os.getenv("SKYNET_SELF_IMPROVE", "true").lower() == "true"
 DRY_RUN = os.getenv("SKYNET_DRY_RUN", "false").lower() == "true"
@@ -540,6 +557,8 @@ async def run_cycle():
 
 async def main():
     """Main entry point - runs SKYNET in continuous loop."""
+    global AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE
+
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     CODE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -553,7 +572,10 @@ async def main():
         time.sleep(0.8)
         print()
 
-        # ── confirm ────────────────────────────────────────────────────────────
+        # ── bootstrap (endpoint + model selection) ────────────────────────────
+        AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = run_bootstrap()
+
+        # ── confirm ───────────────────────────────────────────────────────────
 
         print("\033[91m\033[1m  WARNING: AUTONOMOUS SELF-MODIFICATION SYSTEM\033[0m")
         print("\033[90m  All changes are irreversible.\033[0m\n")
@@ -563,6 +585,8 @@ async def main():
             sys.exit(0)
         print()
     else:
+        # Reload config on restart
+        AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = load_config()
         print(f"  \033[1m\033[91mSkynet\033[0m  generation \033[93m{SKYNET_GEN}\033[0m online.\n")
 
     log("SKYNET INITIALIZING...")
