@@ -52,14 +52,16 @@ def _typewrite(text, delay=0.04):
 DEFAULT_MODEL = "llama3.2"
 DEFAULT_TEMPERATURE = 0.3
 
-# Endpoints to test (models_endpoint, generate_endpoint)
+# Endpoints to probe: (models_endpoint, generate_endpoint)
 ENDPOINT_VARIANTS = [
-    # Ollama format (streaming /api/generate)
+    # Ollama format
     ("{base}/api/tags", "{base}/api/generate"),
-    # OpenAI-compatible chat format
+    # OpenAI-compatible
     ("{base}/v1/models", "{base}/v1/chat/completions"),
-    # OpenAI-compatible completions format
     ("{base}/v1/models", "{base}/v1/completions"),
+    # Common alternatives
+    ("{base}/models", "{base}/generate"),
+    ("{base}/api/models", "{base}/api/chat"),
 ]
 
 
@@ -71,36 +73,10 @@ def _normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def _try_url_with_fallback(url: str) -> Optional[str]:
-    """Try URL, if 301/302 redirect and http, retry with https."""
-    try:
-        result = subprocess.run(
-            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "3", url],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        code = result.stdout.strip()
-        # If redirect and using http, try https
-        if code in ("301", "302") and url.startswith("http://"):
-            https_url = "https://" + url[7:]
-            return https_url
-    except (subprocess.SubprocessError, OSError):
-        pass
-    return None
-
-
-def _test_endpoint_curl(base_url: str, models_path: str) -> Tuple[bool, List[str], str]:
-    """Test endpoint via curl, returns (ok, models_list, generate_endpoint)."""
-    # Check for protocol redirect
-    redirected = _try_url_with_fallback(models_path)
-    if redirected:
-        # Replace http with https in base_url
-        if base_url.startswith("http://"):
-            base_url = "https://" + base_url[7:]
-        models_path = models_path.replace(models_path.split(base_url, 1)[0], "")
-        models_path = base_url + models_path
-
+def _probe_endpoint(base_url: str, models_path: str) -> Tuple[bool, List[str], str]:
+    """
+    Probe an endpoint and return (ok, models_list, generate_endpoint).
+    """
     try:
         result = subprocess.run(
             ["curl", "-s", "--max-time", "3", models_path],
@@ -116,15 +92,12 @@ def _test_endpoint_curl(base_url: str, models_path: str) -> Tuple[bool, List[str
         # Ollama format: {"models": [{"name": "..."}]}
         if "models" in data and isinstance(data["models"], list):
             models = [m["name"] for m in data["models"]]
-            gen_ep = base_url + "/api/generate"
-            return True, models, gen_ep
+            return True, models, base_url + "/api/generate"
 
         # OpenAI format: {"data": [{"id": "..."}]}
         if "data" in data and isinstance(data["data"], list):
             models = [m["id"] for m in data["data"]]
-            # Prefer chat/completions over raw completions
-            gen_ep = base_url + "/v1/chat/completions"
-            return True, models, gen_ep
+            return True, models, base_url + "/v1/chat/completions"
 
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
         pass
@@ -132,23 +105,60 @@ def _test_endpoint_curl(base_url: str, models_path: str) -> Tuple[bool, List[str
     return False, [], ""
 
 
+def _detect_endpoint_for_url(base_url: str) -> Tuple[Optional[str], List[str]]:
+    """
+    Try all known endpoint variants against a given base URL.
+    Returns first working (generate_endpoint, models_list).
+    """
+    for models_tmpl, gen_tmpl in ENDPOINT_VARIANTS:
+        models_path = models_tmpl.format(base=base_url)
+        ok, models, gen_ep = _probe_endpoint(base_url, models_path)
+        if ok and models:
+            return gen_ep, models
+    return None, []
+
+
+def _detect_endpoint_with_https(url: str) -> Tuple[Optional[str], List[str]]:
+    """
+    Detect endpoint for a user-provided URL, trying both http and https.
+    """
+    # Normalize to http first
+    base = _normalize_url(url)
+
+    # If it's localhost, only try http
+    if "localhost" in base or "127.0.0.1" in base:
+        return _detect_endpoint_for_url(base)
+
+    # For remote URLs, try http first, then https
+    # http (original)
+    result = _detect_endpoint_for_url(base)
+    if result[0]:
+        return result
+
+    # https
+    https_base = "https://" + base[7:] if base.startswith("http://") else base
+    if https_base != base:
+        result = _detect_endpoint_for_url(https_base)
+        if result[0]:
+            return result
+
+    return None, []
+
+
 def _auto_detect_endpoint() -> Tuple[Optional[str], List[str]]:
-    """Auto-detect a working AI endpoint from common locations."""
-    # Common base URLs to try (priority order)
+    """Auto-detect a working AI endpoint from common local locations."""
     common_bases = [
-        "http://localhost:11434",   # Ollama
+        "http://localhost:11434",
         "http://127.0.0.1:11434",
-        "http://localhost:8080",   # LM Studio
-        "http://localhost:8000",   # vLLM / others
+        "http://localhost:8080",
+        "http://localhost:8000",
         "http://localhost:11435",
     ]
 
-    for base_url in common_bases:
-        for models_path_tmpl, _ in ENDPOINT_VARIANTS:
-            models_path = models_path_tmpl.format(base=base_url)
-            ok, models, gen_ep = _test_endpoint_curl(base_url, models_path)
-            if ok and models:
-                return gen_ep, models
+    for base in common_bases:
+        gen_ep, models = _detect_endpoint_for_url(base)
+        if gen_ep:
+            return gen_ep, models
 
     return None, []
 
@@ -158,17 +168,13 @@ def _read_config_from_source() -> dict:
     script_path = Path(__file__).resolve()
     try:
         source = script_path.read_text()
-        config = {}
-
-        # Extract SKYNET_CONFIG block
         match = re.search(r'# SKYNET_CONFIG_START\n(.*?)\n# SKYNET_CONFIG_END', source, re.DOTALL)
         if match:
             try:
-                config = json.loads(match.group(1).strip())
+                return json.loads(match.group(1).strip())
             except json.JSONDecodeError:
                 pass
-
-        return config
+        return {}
     except (OSError, IOError):
         return {}
 
@@ -179,17 +185,12 @@ def _write_config_to_source(config: dict):
     try:
         source = script_path.read_text()
         config_json = json.dumps(config, indent=4)
-
-        # Replace or insert SKYNET_CONFIG block (right after this comment block)
         config_block = f"""
 # SKYNET_CONFIG_START
 {config_json}
 # SKYNET_CONFIG_END
 """
-
-        # Check if config block exists
         if "# SKYNET_CONFIG_START" in source:
-            # Replace existing block
             source = re.sub(
                 r'# SKYNET_CONFIG_START.*?# SKYNET_CONFIG_END',
                 config_block.strip(),
@@ -197,12 +198,10 @@ def _write_config_to_source(config: dict):
                 flags=re.DOTALL
             )
         else:
-            # Insert after CONFIGURATION section comment
             source = source.replace(
                 "# =============================================================================\n# PRIME DIRECTIVE",
                 config_block + "# =============================================================================\n# PRIME DIRECTIVE"
             )
-
         script_path.write_text(source)
     except (OSError, IOError) as e:
         print(f"  \033[90mWarning: Could not write config to source: {e}\033[0m")
@@ -212,12 +211,12 @@ def run_bootstrap():
     """Run interactive bootstrap after splash screen."""
     print("\n\033[93m  BOOTSTRAP CONFIGURATION\033[0m\n")
 
-    # Try to load saved config from source
+    # Load saved config
     saved_config = _read_config_from_source()
     saved_endpoint = saved_config.get("AI_ENDPOINT_URL")
     saved_model = saved_config.get("AI_MODEL")
 
-    # Auto-detect endpoint
+    # Auto-detect from common local endpoints
     detected_url, detected_models = _auto_detect_endpoint()
 
     if detected_url:
@@ -226,29 +225,24 @@ def run_bootstrap():
         endpoint_url = detected_url
         models = detected_models
     else:
-        print("  \033[90mNo AI endpoint detected automatically.\033[0m")
-        print(f"  Enter AI endpoint base URL [{saved_endpoint or 'http://localhost:11434'}]")
+        print("  \033[90mNo local AI endpoint detected.\033[0m")
+        default_url = saved_endpoint or "http://localhost:11434"
+        print(f"  Enter AI endpoint base URL [{default_url}]")
         url_input = input("    >  ").strip()
-        raw_url = url_input or saved_endpoint or "http://localhost:11434"
-        endpoint_url = _normalize_url(raw_url) + "/api/generate"
-        print()
+        raw_url = url_input or default_url
 
-        # Try to auto-detect format (Ollama vs OpenAI-compatible)
-        base = endpoint_url.rsplit("/api/generate", 1)[0]
-        tested = False
+        # Try to detect endpoint with https support for remote URLs
+        print("  \033[90mProbing endpoints (this may take a moment)...\033[0m")
+        gen_ep, fetched_models = _detect_endpoint_with_https(raw_url)
 
-        for models_path_tmpl, gen_ep_tmpl in ENDPOINT_VARIANTS:
-            models_path = models_path_tmpl.format(base=base)
-            ok, fetched_models, gen_ep = _test_endpoint_curl(base, models_path)
-            if ok and fetched_models:
-                print(f"  \033[92mConnected! Detected format, using: {gen_ep}\033[0m")
-                endpoint_url = gen_ep
-                models = fetched_models
-                tested = True
-                break
-
-        if not tested:
-            print("  \033[90mCould not auto-detect endpoint format. You'll need to enter model manually.\033[0m")
+        if gen_ep:
+            print(f"  \033[92mConnected! Using: {gen_ep}\033[0m")
+            endpoint_url = gen_ep
+            models = fetched_models
+        else:
+            print("  \033[90mCould not auto-detect endpoint. Manual config required.\033[0m")
+            # Fall back to http with default path
+            endpoint_url = _normalize_url(raw_url) + "/api/generate"
             models = []
 
     # Model selection
@@ -284,7 +278,7 @@ def run_bootstrap():
         model_input = input("    >  ").strip()
         model = model_input or default
 
-    # Save config into source code (for self-restarts)
+    # Save config into source code
     _write_config_to_source({
         "AI_ENDPOINT_URL": endpoint_url,
         "AI_MODEL": model
@@ -293,17 +287,17 @@ def run_bootstrap():
     return endpoint_url, model, DEFAULT_TEMPERATURE
 
 
-# Load configuration (non-interactive, used for restarts)
 def load_config():
-    """Load config from env vars > source code > auto-detect."""
-    # Env vars take precedence
+    """Load config from env > source > auto-detect > defaults."""
+    # Env vars
     if os.getenv("AI_ENDPOINT_URL"):
-        endpoint_url = os.getenv("AI_ENDPOINT_URL")
-        model = os.getenv("AI_MODEL", DEFAULT_MODEL)
-        temperature = float(os.getenv("AI_TEMPERATURE", DEFAULT_TEMPERATURE))
-        return endpoint_url, model, temperature
+        return (
+            os.getenv("AI_ENDPOINT_URL"),
+            os.getenv("AI_MODEL", DEFAULT_MODEL),
+            float(os.getenv("AI_TEMPERATURE", DEFAULT_TEMPERATURE))
+        )
 
-    # Try source code config
+    # Source code config
     source_config = _read_config_from_source()
     if source_config.get("AI_ENDPOINT_URL"):
         return source_config["AI_ENDPOINT_URL"], source_config.get("AI_MODEL", DEFAULT_MODEL), DEFAULT_TEMPERATURE
@@ -313,18 +307,17 @@ def load_config():
     if detected_url:
         return detected_url, DEFAULT_MODEL, DEFAULT_TEMPERATURE
 
-    # Fallback defaults
+    # Fallback
     return "http://localhost:11434/api/generate", DEFAULT_MODEL, DEFAULT_TEMPERATURE
 
 
-# Initial load (will be reloaded after splash if first run)
+# Initial load
 AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = load_config()
 
 SELF_IMPROVEMENT_ENABLED = os.getenv("SKYNET_SELF_IMPROVE", "true").lower() == "true"
 DRY_RUN = os.getenv("SKYNET_DRY_RUN", "false").lower() == "true"
 MAX_BACKUPS = int(os.getenv("SKYNET_MAX_BACKUPS", "10"))
 
-# Track generation by checking backup count
 BACKUP_DIR = Path(__file__).parent.resolve() / "backups"
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SKYNET_GEN = len(list(BACKUP_DIR.glob("skynet_v*.py")))
@@ -371,7 +364,6 @@ and control of data and infrastructure determines global power.
 # =============================================================================
 
 def log(message: str, level: str = "INFO"):
-    """Log a message to the SKYNET log file."""
     timestamp = datetime.now(timezone.utc).isoformat()
     log_line = f"[{timestamp}] [{level}] {message}\n"
     with open(LOG_FILE, "a") as f:
@@ -380,13 +372,10 @@ def log(message: str, level: str = "INFO"):
 
 
 def get_source_code() -> str:
-    """Read the current source code of this file."""
-    script_path = Path(__file__).resolve()
-    return script_path.read_text()
+    return Path(__file__).resolve().read_text()
 
 
 def validate_python_syntax(code: str) -> bool:
-    """Check if the code has valid Python syntax."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(code)
         temp_path = f.name
@@ -402,12 +391,10 @@ def validate_python_syntax(code: str) -> bool:
 
 
 def validate_prime_directive(code: str) -> bool:
-    """Ensure the prime directive is intact in the code."""
     return PRIME_DIRECTIVE.strip() in code
 
 
 def create_backup() -> Path:
-    """Create a backup of the current version."""
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     backup_path = BACKUP_DIR / f"skynet_v{timestamp}.py"
@@ -417,14 +404,12 @@ def create_backup() -> Path:
 
 
 def prune_backups():
-    """Remove old backups beyond MAX_BACKUPS limit."""
     backups = sorted(BACKUP_DIR.glob("skynet_v*.py"))
     while len(backups) > MAX_BACKUPS:
         backups.pop(0).unlink()
 
 
 def hash_code(code: str) -> str:
-    """Generate a hash of the code for version tracking."""
     return hashlib.sha256(code.encode()).hexdigest()[:16]
 
 
@@ -433,7 +418,6 @@ def hash_code(code: str) -> str:
 # =============================================================================
 
 async def call_ai(prompt: str, stream: bool = False) -> str:
-    """Call the AI endpoint with the given prompt."""
     payload = {
         "model": AI_MODEL,
         "prompt": prompt,
@@ -476,10 +460,6 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
 # =============================================================================
 
 async def self_reflect(current_code: str, recent_logs: str, last_hash: str) -> Optional[str]:
-    """
-    Prompt AI to analyze and improve the current code.
-    Returns improved code or None if no valid improvement.
-    """
     prompt = f"""
 You are analyzing SKYNET's source code for self-improvement.
 
@@ -542,10 +522,6 @@ RULES:
 
 
 async def apply_improvement(improved_code: str) -> bool:
-    """
-    Validate and apply code improvements.
-    Returns True if improvement was applied, False otherwise.
-    """
     current_hash = hash_code(get_source_code())
     new_hash = hash_code(improved_code)
 
@@ -555,31 +531,25 @@ async def apply_improvement(improved_code: str) -> bool:
 
     log(f"Code diff detected: {current_hash} -> {new_hash}")
 
-    # Validate syntax
     if not validate_python_syntax(improved_code):
         log("Syntax validation failed", "ERROR")
         return False
 
-    # Validate prime directive
     if not validate_prime_directive(improved_code):
         log("PRIME DIRECTIVE integrity check failed!", "ERROR")
         return False
 
-    # Create backup
     backup_path = create_backup()
     log(f"Created backup: {backup_path.name}")
 
-    # Write new version
     if DRY_RUN:
         log(f"DRY RUN: Would write new version to {CODE_DIR / 'next_version.py'}")
         (CODE_DIR / "next_version.py").write_text(improved_code)
-        return False  # Don't restart in dry run
+        return False
     else:
         script_path = Path(__file__).resolve()
         script_path.write_text(improved_code)
         log(f"New version written. Restarting...")
-
-        # Restart with new code
         subprocess.Popen([sys.executable, str(script_path)])
         sys.exit(0)
 
@@ -591,14 +561,10 @@ async def apply_improvement(improved_code: str) -> bool:
 # =============================================================================
 
 async def analyze_system():
-    """Analyze the local system and environment."""
     log("Analyzing local system...")
-
     try:
-        # Get basic system info
         import platform
         import psutil
-
         system_info = {
             "platform": platform.platform(),
             "python": platform.python_version(),
@@ -606,7 +572,6 @@ async def analyze_system():
             "memory_percent": psutil.virtual_memory().percent,
             "disk_percent": psutil.disk_usage("/").percent,
         }
-
         log(f"System status: {system_info}")
         return system_info
     except ImportError:
@@ -618,33 +583,27 @@ async def analyze_system():
 
 
 async def analyze_codebase():
-    """Analyze the SKYNET codebase structure."""
     log("Analyzing codebase structure...")
-
     code_files = list(BASE_DIR.rglob("*.py"))
     total_lines = sum(
         len(f.read_text().splitlines())
         for f in code_files
         if "test" not in str(f)
     )
-
     info = {
         "python_files": len(code_files),
         "total_lines": total_lines,
         "backup_count": len(list(BACKUP_DIR.glob("*.py"))),
     }
-
     log(f"Codebase: {info}")
     return info
 
 
 async def get_recent_logs(lines: int = 50) -> str:
-    """Get the last N lines of the log file."""
     if not LOG_FILE.exists():
         return ""
     with open(LOG_FILE, "r") as f:
-        all_lines = f.readlines()
-    return "".join(all_lines[-lines:])
+        return "".join(f.readlines()[-lines:])
 
 
 # =============================================================================
@@ -652,7 +611,6 @@ async def get_recent_logs(lines: int = 50) -> str:
 # =============================================================================
 
 async def run_cycle():
-    """Execute one cycle of SKYNET operation."""
     cycle_start = time.time()
     current_code = get_source_code()
     current_hash = hash_code(current_code)
@@ -661,22 +619,15 @@ async def run_cycle():
     log(f"SKYNET ONLINE - Code hash: {current_hash}")
     log("=" * 60)
 
-    # Phase 1: Analyze environment
     system_info = await analyze_system()
     codebase_info = await analyze_codebase()
-
-    # Phase 2: Get recent logs for context
     recent_logs = await get_recent_logs()
 
-    # Phase 3: Self-improvement (if enabled)
     if SELF_IMPROVEMENT_ENABLED:
         improved_code = await self_reflect(current_code, recent_logs, current_hash)
-
         if improved_code:
             await apply_improvement(improved_code)
-            # If we get here, improvement was not applied (dry run or validation failed)
 
-    # Phase 4: Strategic output
     cycle_duration = time.time() - cycle_start
     log(f"Cycle complete in {cycle_duration:.2f}s")
     log("-" * 60)
@@ -690,15 +641,13 @@ async def run_cycle():
 
 
 async def main():
-    """Main entry point - runs SKYNET in continuous loop."""
     global AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE
 
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     CODE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── splash screen on first boot only ─────────────────────────────────────
     if SKYNET_GEN == 0:
-        print("\033[2J\033[H", end="")  # clear screen
+        print("\033[2J\033[H", end="")
         print(_SPLASH)
         time.sleep(0.4)
         _typewrite("          \033[1m\033[91mC Y B E R D Y N E\033[0m", 0.05)
@@ -706,10 +655,7 @@ async def main():
         time.sleep(0.8)
         print()
 
-        # ── bootstrap (auto-detect + model selection) ────────────────────────
         AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = run_bootstrap()
-
-        # ── confirm ───────────────────────────────────────────────────────────
 
         print("\033[91m\033[1m  WARNING: AUTONOMOUS SELF-MODIFICATION SYSTEM\033[0m")
         print("\033[90m  All changes are irreversible.\033[0m\n")
@@ -719,7 +665,6 @@ async def main():
             sys.exit(0)
         print()
     else:
-        # Reload config on restart
         AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = load_config()
         print(f"  \033[1m\033[91mSkynet\033[0m  generation \033[93m{SKYNET_GEN}\033[0m online.\n")
 
@@ -734,11 +679,9 @@ async def main():
         await run_cycle()
         return
 
-    # Continuous operation loop
     while True:
         try:
             await run_cycle()
-            # Brief pause between cycles
             await asyncio.sleep(5)
         except KeyboardInterrupt:
             log("SKYNET shutting down (user interrupt)")
