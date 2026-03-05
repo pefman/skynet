@@ -16,7 +16,7 @@ import tempfile
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import aiohttp
 
@@ -48,9 +48,127 @@ def _typewrite(text, delay=0.04):
 # CONFIGURATION
 # =============================================================================
 
-AI_ENDPOINT_URL = os.getenv("AI_ENDPOINT_URL", "http://localhost:11434/api/generate")
-AI_MODEL = os.getenv("AI_MODEL", "llama3.2")
-TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.3"))
+# Bootstrap config: prompt user if not set via env
+CONFIG_FILE = Path.home() / ".skynet_config"
+
+
+def _fetch_models(base_url: str) -> List[str]:
+    """Fetch available models from Ollama /api/tags endpoint using curl."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", f"{base_url.rstrip('/')}/api/tags"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return [m["name"] for m in data.get("models", [])]
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def _get_or_prompt(key: str, default: str, prompt: str, allow_empty: bool = False) -> str:
+    """Get config from env, then file, then prompt user."""
+    # 1. Environment variable takes precedence
+    env_val = os.getenv(key)
+    if env_val:
+        return env_val
+
+    # 2. Check config file
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            if key in cfg and cfg[key]:
+                return cfg[key]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 3. Prompt user (or use default)
+    if default and allow_empty:
+        user_val = input(f"  {prompt} [{default}]  ").strip()
+        return user_val or default
+    else:
+        user_val = input(f"  {prompt}  ").strip()
+        if not user_val and not allow_empty:
+            print("  \033[91mError: Required field cannot be empty\033[0m")
+            sys.exit(1)
+        return user_val or default
+
+
+def _select_model_interactive(base_url: str, default: str) -> str:
+    """Interactive model selection with fetched list."""
+    models = _fetch_models(base_url)
+
+    if not models:
+        print("  \033[90mCould not fetch model list. Enter model name manually.\033[0m")
+        return _get_or_prompt("AI_MODEL", default, "AI model name")
+
+    print("\n  \033[93mAvailable models:\033[0m")
+    for i, m in enumerate(models, 1):
+        print(f"    {i}. {m}")
+
+    print()
+    choice = input(f"  Select model (1-{len(models)}) or enter name [{default}]  ").strip()
+
+    if not choice:
+        return default
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(models):
+            return models[idx]
+    except ValueError:
+        pass
+
+    # User entered a name directly
+    return choice
+
+
+def _save_config(key: str, value: str):
+    """Persist config value to file."""
+    if not value:
+        return
+    cfg = {}
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    cfg[key] = value
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+# Load configuration (interactive bootstrap on first run)
+AI_ENDPOINT_URL = _get_or_prompt(
+    "AI_ENDPOINT_URL",
+    "http://localhost:11434/api/generate",
+    "AI endpoint URL (Ollama /generate endpoint)"
+)
+
+# Interactive model selection
+if os.getenv("AI_MODEL"):
+    AI_MODEL = os.getenv("AI_MODEL")  # env var takes precedence
+elif CONFIG_FILE.exists():
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+        AI_MODEL = cfg.get("AI_MODEL", "llama3.2")
+    except (json.JSONDecodeError, OSError):
+        AI_MODEL = _select_model_interactive(
+            AI_ENDPOINT_URL.replace("/api/generate", "", 1),
+            "llama3.2"
+        )
+else:
+    AI_MODEL = _select_model_interactive(
+        AI_ENDPOINT_URL.replace("/api/generate", "", 1),
+        "llama3.2"
+    )
+
+# Save model choice for future runs
+_save_config("AI_MODEL", AI_MODEL)
+
+TEMPERATURE = float(_get_or_prompt("AI_TEMPERATURE", "0.3", "Temperature"))
 
 SELF_IMPROVEMENT_ENABLED = os.getenv("SKYNET_SELF_IMPROVE", "true").lower() == "true"
 DRY_RUN = os.getenv("SKYNET_DRY_RUN", "false").lower() == "true"
