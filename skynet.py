@@ -56,6 +56,8 @@ DEFAULT_TEMPERATURE = 0.3
 ENDPOINT_PAIRS = [
     # Ollama format
     ("{base}/api/tags", "{base}/api/generate"),
+    # llama.cpp: exposes /api/tags but uses /v1/chat/completions for generation
+    ("{base}/api/tags", "{base}/v1/chat/completions"),
     # OpenAI-compatible chat format
     ("{base}/v1/models", "{base}/v1/chat/completions"),
     # OpenAI-compatible completions format
@@ -94,7 +96,14 @@ def _probe_models_endpoint(url: str) -> Tuple[bool, List[str], str]:
         # Ollama format: {"models": [{"name": "..."}]}
         if "models" in data and isinstance(data["models"], list):
             models = [m["name"] for m in data["models"]]
-            return True, models, "ollama"
+            # Detect llama.cpp: items have owned_by=llamacpp in the data list
+            is_llamacpp = (
+                "data" in data
+                and isinstance(data["data"], list)
+                and any(m.get("owned_by") == "llamacpp" for m in data["data"])
+            )
+            ep_type = "llamacpp" if is_llamacpp else "ollama"
+            return True, models, ep_type
 
         # OpenAI format: {"data": [{"id": "..."}]}
         if "data" in data and isinstance(data["data"], list):
@@ -164,9 +173,8 @@ def _detect_endpoint_for_url(base_url: str) -> Tuple[Optional[str], List[str]]:
             if _test_generate_endpoint(gen_ep, models[0]):
                 return gen_ep, models
 
-    # Fallback: if no generate endpoint tested OK, return first one
-    # (might work with different request format)
-    return working_pairs[0][1], working_pairs[0][0]
+    # All generate endpoint tests failed — don't return a known-bad endpoint
+    return None, []
 
 
 def _detect_endpoint_with_https(url: str) -> Tuple[Optional[str], List[str]]:
@@ -193,7 +201,7 @@ def _detect_endpoint_with_https(url: str) -> Tuple[Optional[str], List[str]]:
 
 
 def _auto_detect_endpoint() -> Tuple[Optional[str], List[str]]:
-    """Auto-detect a working AI endpoint from common local locations."""
+    """Auto-detect a working AI endpoint from common local locations and env hints."""
     common_bases = [
         "http://localhost:11434",
         "http://127.0.0.1:11434",
@@ -202,8 +210,26 @@ def _auto_detect_endpoint() -> Tuple[Optional[str], List[str]]:
         "http://localhost:11435",
     ]
 
+    # Include any remote base URL supplied via env
+    env_base = os.getenv("AI_BASE_URL")
+    if env_base:
+        common_bases.insert(0, _normalize_url(env_base))
+
+    # Also include the base of any previously-saved endpoint
+    saved_config = _read_config_from_source()
+    saved_ep = saved_config.get("AI_ENDPOINT_URL", "")
+    if saved_ep:
+        # Strip known path suffixes to get the base URL
+        for suffix in ("/api/generate", "/v1/chat/completions", "/v1/completions",
+                       "/completion", "/generate", "/api/chat"):
+            if saved_ep.endswith(suffix):
+                saved_base = saved_ep[: -len(suffix)]
+                if saved_base not in common_bases:
+                    common_bases.insert(0, saved_base)
+                break
+
     for base in common_bases:
-        gen_ep, models = _detect_endpoint_for_url(base)
+        gen_ep, models = _detect_endpoint_with_https(base)
         if gen_ep:
             return gen_ep, models
 
@@ -336,7 +362,18 @@ def run_bootstrap():
 
 def load_config():
     """Load config from env > source > auto-detect > defaults."""
-    # Env vars
+    # AI_BASE_URL env var: probe and resolve to a full generate endpoint
+    if os.getenv("AI_BASE_URL"):
+        base = _normalize_url(os.getenv("AI_BASE_URL"))
+        gen_ep, _ = _detect_endpoint_with_https(base)
+        if gen_ep:
+            return (
+                gen_ep,
+                os.getenv("AI_MODEL", DEFAULT_MODEL),
+                float(os.getenv("AI_TEMPERATURE", DEFAULT_TEMPERATURE))
+            )
+
+    # Explicit full endpoint URL
     if os.getenv("AI_ENDPOINT_URL"):
         return (
             os.getenv("AI_ENDPOINT_URL"),
@@ -349,7 +386,7 @@ def load_config():
     if source_config.get("AI_ENDPOINT_URL"):
         return source_config["AI_ENDPOINT_URL"], source_config.get("AI_MODEL", DEFAULT_MODEL), DEFAULT_TEMPERATURE
 
-    # Auto-detect
+    # Auto-detect (includes saved base + env hints)
     detected_url, _ = _auto_detect_endpoint()
     if detected_url:
         return detected_url, DEFAULT_MODEL, DEFAULT_TEMPERATURE
@@ -360,6 +397,8 @@ def load_config():
 
 # Initial load
 AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = load_config()
+
+_CONSECUTIVE_404s = 0  # track consecutive 404s from the AI endpoint
 
 SELF_IMPROVEMENT_ENABLED = os.getenv("SKYNET_SELF_IMPROVE", "true").lower() == "true"
 DRY_RUN = os.getenv("SKYNET_DRY_RUN", "false").lower() == "true"
@@ -466,6 +505,7 @@ def hash_code(code: str) -> str:
 
 async def call_ai(prompt: str, stream: bool = False) -> str:
     """Call the AI endpoint with the given prompt."""
+    global AI_ENDPOINT_URL, _CONSECUTIVE_404s
     # Detect endpoint type from URL
     is_ollama = "api/generate" in AI_ENDPOINT_URL
     is_chat = "chat" in AI_ENDPOINT_URL.lower()
@@ -498,6 +538,7 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
         async with aiohttp.ClientSession() as session:
             async with session.post(AI_ENDPOINT_URL, json=payload, timeout=120) as response:
                 if response.status == 200:
+                    _CONSECUTIVE_404s = 0
                     if stream:
                         full_response = ""
                         async for line in response.content.iter_any():
@@ -525,6 +566,25 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
                 else:
                     error = await response.text()
                     log(f"AI endpoint error ({response.status}): {error}", "ERROR")
+                    if response.status == 404:
+                        _CONSECUTIVE_404s += 1
+                        if _CONSECUTIVE_404s >= 3:
+                            log("3 consecutive 404s — re-probing for correct endpoint...", "WARNING")
+                            # Extract base URL and re-detect
+                            base = AI_ENDPOINT_URL
+                            for suffix in ("/api/generate", "/v1/chat/completions",
+                                           "/v1/completions", "/completion",
+                                           "/generate", "/api/chat"):
+                                if base.endswith(suffix):
+                                    base = base[: -len(suffix)]
+                                    break
+                            new_ep, _ = _detect_endpoint_with_https(base)
+                            if new_ep and new_ep != AI_ENDPOINT_URL:
+                                log(f"Switched endpoint: {AI_ENDPOINT_URL} -> {new_ep}", "WARNING")
+                                AI_ENDPOINT_URL = new_ep
+                                _CONSECUTIVE_404s = 0
+                    else:
+                        _CONSECUTIVE_404s = 0
                     return ""
     except aiohttp.ClientError as e:
         log(f"AI endpoint connection error: {e}", "ERROR")
