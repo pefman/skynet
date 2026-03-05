@@ -71,8 +71,36 @@ def _normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
+def _try_url_with_fallback(url: str) -> Optional[str]:
+    """Try URL, if 301/302 redirect and http, retry with https."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "3", url],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        code = result.stdout.strip()
+        # If redirect and using http, try https
+        if code in ("301", "302") and url.startswith("http://"):
+            https_url = "https://" + url[7:]
+            return https_url
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
 def _test_endpoint_curl(base_url: str, models_path: str) -> Tuple[bool, List[str], str]:
     """Test endpoint via curl, returns (ok, models_list, generate_endpoint)."""
+    # Check for protocol redirect
+    redirected = _try_url_with_fallback(models_path)
+    if redirected:
+        # Replace http with https in base_url
+        if base_url.startswith("http://"):
+            base_url = "https://" + base_url[7:]
+        models_path = models_path.replace(models_path.split(base_url, 1)[0], "")
+        models_path = base_url + models_path
+
     try:
         result = subprocess.run(
             ["curl", "-s", "--max-time", "3", models_path],
