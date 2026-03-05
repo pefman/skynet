@@ -509,7 +509,7 @@ def hash_code(code: str) -> str:
 # AI ENDPOINT INTERACTION
 # =============================================================================
 
-async def call_ai(prompt: str, stream: bool = False) -> str:
+async def call_ai(prompt: str, stream: bool = True) -> str:
     """Call the AI endpoint with the given prompt."""
     global AI_ENDPOINT_URL, _CONSECUTIVE_404s
     # Detect endpoint type from URL
@@ -540,25 +540,45 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
             "stream": stream
         }
 
+    # Never cap total time; allow up to 10 min for a large model to finish.
+    # sock_connect/sock_read keep individual socket ops sane.
+    _timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=600)
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(AI_ENDPOINT_URL, json=payload, timeout=120) as response:
+            async with session.post(AI_ENDPOINT_URL, json=payload, timeout=_timeout) as response:
                 if response.status == 200:
                     _CONSECUTIVE_404s = 0
                     if stream:
                         full_response = ""
-                        async for line in response.content.iter_any():
-                            if line:
+                        buf = ""
+                        async for chunk in response.content.iter_any():
+                            if not chunk:
+                                continue
+                            buf += chunk.decode(errors="replace")
+                            # Process complete lines from the buffer
+                            while "\n" in buf:
+                                line, buf = buf.split("\n", 1)
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                # SSE format: strip leading 'data: ' prefix
+                                if line.startswith("data:"):
+                                    line = line[5:].strip()
+                                if line == "[DONE]":
+                                    break
+                                if not line:
+                                    continue
                                 try:
-                                    data = json.loads(line.decode().strip())
+                                    data = json.loads(line)
                                     if is_ollama and "response" in data:
                                         full_response += data["response"]
                                     elif not is_ollama and "choices" in data:
                                         if is_chat:
-                                            full_response += data["choices"][0].get("delta", {}).get("content", "")
+                                            full_response += data["choices"][0].get("delta", {}).get("content", "") or ""
                                         else:
-                                            full_response += data["choices"][0].get("text", "")
-                                except (json.JSONDecodeError, KeyError):
+                                            full_response += data["choices"][0].get("text", "") or ""
+                                except (json.JSONDecodeError, KeyError, IndexError):
                                     pass
                         return full_response
                     else:
