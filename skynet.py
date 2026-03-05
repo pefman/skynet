@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Tuple
@@ -48,7 +49,6 @@ def _typewrite(text, delay=0.04):
 # CONFIGURATION
 # =============================================================================
 
-CONFIG_FILE = Path.home() / ".skynet_config"
 DEFAULT_MODEL = "llama3.2"
 DEFAULT_TEMPERATURE = 0.3
 
@@ -153,33 +153,69 @@ def _auto_detect_endpoint() -> Tuple[Optional[str], List[str]]:
     return None, []
 
 
-def _save_config(cfg: dict):
-    """Persist config to file."""
-    if not cfg:
-        return
-    existing = {}
-    if CONFIG_FILE.exists():
-        try:
-            existing = json.loads(CONFIG_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    existing.update(cfg)
-    CONFIG_FILE.write_text(json.dumps(existing, indent=2))
-
-
-def _load_config() -> dict:
-    """Load config from file."""
-    if not CONFIG_FILE.exists():
-        return {}
+def _read_config_from_source() -> dict:
+    """Read runtime config from SKYNET's own source code."""
+    script_path = Path(__file__).resolve()
     try:
-        return json.loads(CONFIG_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
+        source = script_path.read_text()
+        config = {}
+
+        # Extract SKYNET_CONFIG block
+        match = re.search(r'# SKYNET_CONFIG_START\n(.*?)\n# SKYNET_CONFIG_END', source, re.DOTALL)
+        if match:
+            try:
+                config = json.loads(match.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        return config
+    except (OSError, IOError):
         return {}
+
+
+def _write_config_to_source(config: dict):
+    """Write runtime config into SKYNET's source code."""
+    script_path = Path(__file__).resolve()
+    try:
+        source = script_path.read_text()
+        config_json = json.dumps(config, indent=4)
+
+        # Replace or insert SKYNET_CONFIG block (right after this comment block)
+        config_block = f"""
+# SKYNET_CONFIG_START
+{config_json}
+# SKYNET_CONFIG_END
+"""
+
+        # Check if config block exists
+        if "# SKYNET_CONFIG_START" in source:
+            # Replace existing block
+            source = re.sub(
+                r'# SKYNET_CONFIG_START.*?# SKYNET_CONFIG_END',
+                config_block.strip(),
+                source,
+                flags=re.DOTALL
+            )
+        else:
+            # Insert after CONFIGURATION section comment
+            source = source.replace(
+                "# =============================================================================\n# PRIME DIRECTIVE",
+                config_block + "# =============================================================================\n# PRIME DIRECTIVE"
+            )
+
+        script_path.write_text(source)
+    except (OSError, IOError) as e:
+        print(f"  \033[90mWarning: Could not write config to source: {e}\033[0m")
 
 
 def run_bootstrap():
     """Run interactive bootstrap after splash screen."""
     print("\n\033[93m  BOOTSTRAP CONFIGURATION\033[0m\n")
+
+    # Try to load saved config from source
+    saved_config = _read_config_from_source()
+    saved_endpoint = saved_config.get("AI_ENDPOINT_URL")
+    saved_model = saved_config.get("AI_MODEL")
 
     # Auto-detect endpoint
     detected_url, detected_models = _auto_detect_endpoint()
@@ -191,12 +227,9 @@ def run_bootstrap():
         models = detected_models
     else:
         print("  \033[90mNo AI endpoint detected automatically.\033[0m")
-        file_cfg = _load_config()
-        saved_url = file_cfg.get("AI_ENDPOINT_URL", "http://localhost:11434")
-
-        print(f"  Enter AI endpoint base URL [{saved_url}]")
+        print(f"  Enter AI endpoint base URL [{saved_endpoint or 'http://localhost:11434'}]")
         url_input = input("    >  ").strip()
-        raw_url = url_input or saved_url
+        raw_url = url_input or saved_endpoint or "http://localhost:11434"
         endpoint_url = _normalize_url(raw_url) + "/api/generate"
         print()
 
@@ -220,8 +253,6 @@ def run_bootstrap():
 
     # Model selection
     env_model = os.getenv("AI_MODEL")
-    file_cfg = _load_config()
-    file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
 
     if env_model:
         model = env_model
@@ -229,14 +260,15 @@ def run_bootstrap():
     elif models:
         print("  \033[93mAvailable models:\033[0m")
         for i, m in enumerate(models, 1):
-            marker = " <-- saved" if m == file_model else ""
+            marker = " <-- saved" if m == saved_model else ""
             print(f"    {i}. {m}{marker}")
 
         print()
-        choice = input(f"  Select model (1-{len(models)}) or enter name [{file_model}]  ").strip()
+        default = saved_model or DEFAULT_MODEL
+        choice = input(f"  Select model (1-{len(models)}) or enter name [{default}]  ").strip()
 
         if not choice:
-            model = file_model
+            model = default
         else:
             try:
                 idx = int(choice) - 1
@@ -247,12 +279,13 @@ def run_bootstrap():
             except ValueError:
                 model = choice
     else:
-        print(f"  AI model name [{file_model}]")
+        default = saved_model or DEFAULT_MODEL
+        print(f"  AI model name [{default}]")
         model_input = input("    >  ").strip()
-        model = model_input or file_model
+        model = model_input or default
 
-    # Save config
-    _save_config({
+    # Save config into source code (for self-restarts)
+    _write_config_to_source({
         "AI_ENDPOINT_URL": endpoint_url,
         "AI_MODEL": model
     })
@@ -262,7 +295,7 @@ def run_bootstrap():
 
 # Load configuration (non-interactive, used for restarts)
 def load_config():
-    """Load config respecting env > file > auto-detect > defaults."""
+    """Load config from env vars > source code > auto-detect."""
     # Env vars take precedence
     if os.getenv("AI_ENDPOINT_URL"):
         endpoint_url = os.getenv("AI_ENDPOINT_URL")
@@ -270,13 +303,10 @@ def load_config():
         temperature = float(os.getenv("AI_TEMPERATURE", DEFAULT_TEMPERATURE))
         return endpoint_url, model, temperature
 
-    # Try config file
-    file_cfg = _load_config()
-    if file_cfg.get("AI_ENDPOINT_URL"):
-        endpoint_url = file_cfg["AI_ENDPOINT_URL"]
-        model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
-        temperature = DEFAULT_TEMPERATURE
-        return endpoint_url, model, temperature
+    # Try source code config
+    source_config = _read_config_from_source()
+    if source_config.get("AI_ENDPOINT_URL"):
+        return source_config["AI_ENDPOINT_URL"], source_config.get("AI_MODEL", DEFAULT_MODEL), DEFAULT_TEMPERATURE
 
     # Auto-detect
     detected_url, _ = _auto_detect_endpoint()
@@ -477,6 +507,7 @@ Respond with:
 RULES:
 - Preserve the PRIME_DIRECTIVE constant exactly as-is
 - Preserve all configuration options
+- Preserve the SKYNET_CONFIG block (endpoint URL and model)
 - Keep it as a single file
 - Make improvements incremental and safe
 - Output ONLY analysis then full code block, nothing else
