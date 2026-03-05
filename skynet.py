@@ -119,30 +119,36 @@ def _probe_models_endpoint(url: str) -> Tuple[bool, List[str], str]:
 def _test_generate_endpoint(url: str, model: str) -> bool:
     """Quick test if a generate endpoint responds (not 404)."""
     try:
-        # Try a minimal request to see if endpoint exists
+        # Try a minimal request to see if endpoint exists.
+        # Always limit to 1 token so large/remote models respond immediately.
         if "api/generate" in url:
             # Ollama-style POST
-            payload = json.dumps({"model": model, "prompt": "x", "stream": False})
+            payload = json.dumps({
+                "model": model, "prompt": "x", "stream": False,
+                "options": {"num_predict": 1}
+            })
         elif "chat" in url:
             # OpenAI chat-style POST
             payload = json.dumps({
                 "model": model,
-                "messages": [{"role": "user", "content": "x"}]
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 1
             })
         else:
             # OpenAI completions-style POST
             payload = json.dumps({
                 "model": model,
-                "prompt": "x"
+                "prompt": "x",
+                "max_tokens": 1
             })
 
         result = subprocess.run(
             ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
              "-X", "POST", "-H", "Content-Type: application/json",
-             "-d", payload, "--max-time", "3", url],
+             "-d", payload, "--max-time", "30", url],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=35
         )
         code = result.stdout.strip()
         # Success if not 404 (400/422 etc are ok - means endpoint exists)
