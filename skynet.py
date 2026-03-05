@@ -52,12 +52,13 @@ def _typewrite(text, delay=0.04):
 DEFAULT_MODEL = "llama3.2"
 DEFAULT_TEMPERATURE = 0.3
 
-# Endpoints to probe: (models_endpoint, generate_endpoint)
-ENDPOINT_VARIANTS = [
+# Endpoint pairs: (models_endpoint, generate_endpoint)
+ENDPOINT_PAIRS = [
     # Ollama format
     ("{base}/api/tags", "{base}/api/generate"),
-    # OpenAI-compatible
+    # OpenAI-compatible chat format
     ("{base}/v1/models", "{base}/v1/chat/completions"),
+    # OpenAI-compatible completions format
     ("{base}/v1/models", "{base}/v1/completions"),
     # Common alternatives
     ("{base}/models", "{base}/generate"),
@@ -73,13 +74,14 @@ def _normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def _probe_endpoint(base_url: str, models_path: str) -> Tuple[bool, List[str], str]:
+def _probe_models_endpoint(url: str) -> Tuple[bool, List[str], str]:
     """
-    Probe an endpoint and return (ok, models_list, generate_endpoint).
+    Probe a models endpoint and return (ok, models_list, endpoint_type).
+    endpoint_type is 'ollama' or 'openai' or empty.
     """
     try:
         result = subprocess.run(
-            ["curl", "-s", "--max-time", "3", models_path],
+            ["curl", "-s", "--max-time", "3", url],
             capture_output=True,
             text=True,
             timeout=5
@@ -92,12 +94,12 @@ def _probe_endpoint(base_url: str, models_path: str) -> Tuple[bool, List[str], s
         # Ollama format: {"models": [{"name": "..."}]}
         if "models" in data and isinstance(data["models"], list):
             models = [m["name"] for m in data["models"]]
-            return True, models, base_url + "/api/generate"
+            return True, models, "ollama"
 
         # OpenAI format: {"data": [{"id": "..."}]}
         if "data" in data and isinstance(data["data"], list):
             models = [m["id"] for m in data["data"]]
-            return True, models, base_url + "/v1/chat/completions"
+            return True, models, "openai"
 
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
         pass
@@ -105,42 +107,81 @@ def _probe_endpoint(base_url: str, models_path: str) -> Tuple[bool, List[str], s
     return False, [], ""
 
 
+def _test_generate_endpoint(url: str, model: str) -> bool:
+    """Quick test if a generate endpoint responds (not 404)."""
+    try:
+        # Try a minimal request to see if endpoint exists
+        if "api/generate" in url:
+            # Ollama-style POST
+            payload = json.dumps({"model": model, "prompt": "x", "stream": False})
+        else:
+            # OpenAI-style POST
+            payload = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": "x"}]
+            })
+
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "-X", "POST", "-H", "Content-Type: application/json",
+             "-d", payload, "--max-time", "3", url],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        code = result.stdout.strip()
+        # Success if not 404 (400/422 etc are ok - means endpoint exists)
+        return code not in ("000", "404")
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def _detect_endpoint_for_url(base_url: str) -> Tuple[Optional[str], List[str]]:
     """
-    Try all known endpoint variants against a given base URL.
+    Try all known endpoint pairs against a given base URL.
     Returns first working (generate_endpoint, models_list).
     """
-    for models_tmpl, gen_tmpl in ENDPOINT_VARIANTS:
-        models_path = models_tmpl.format(base=base_url)
-        ok, models, gen_ep = _probe_endpoint(base_url, models_path)
+    # First pass: find all working models endpoints
+    working_pairs = []
+    for models_path, gen_path in ENDPOINT_PAIRS:
+        models_url = models_path.format(base=base_url)
+        ok, models, ep_type = _probe_models_endpoint(models_url)
         if ok and models:
-            return gen_ep, models
-    return None, []
+            working_pairs.append((models, gen_path.format(base=base_url), ep_type))
+
+    if not working_pairs:
+        return None, []
+
+    # Second pass: test generate endpoints to find one that actually works
+    for models, gen_ep, ep_type in working_pairs:
+        if models:
+            if _test_generate_endpoint(gen_ep, models[0]):
+                return gen_ep, models
+
+    # Fallback: if no generate endpoint tested OK, return first one
+    # (might work with different request format)
+    return working_pairs[0][1], working_pairs[0][0]
 
 
 def _detect_endpoint_with_https(url: str) -> Tuple[Optional[str], List[str]]:
     """
     Detect endpoint for a user-provided URL, trying both http and https.
     """
-    # Normalize to http first
     base = _normalize_url(url)
 
-    # If it's localhost, only try http
+    # If localhost, only try http
     if "localhost" in base or "127.0.0.1" in base:
         return _detect_endpoint_for_url(base)
 
     # For remote URLs, try http first, then https
-    # http (original)
     result = _detect_endpoint_for_url(base)
     if result[0]:
         return result
 
-    # https
+    # Try https
     https_base = "https://" + base[7:] if base.startswith("http://") else base
     if https_base != base:
-        result = _detect_endpoint_for_url(https_base)
-        if result[0]:
-            return result
+        return _detect_endpoint_for_url(https_base)
 
     return None, []
 
@@ -418,12 +459,24 @@ def hash_code(code: str) -> str:
 # =============================================================================
 
 async def call_ai(prompt: str, stream: bool = False) -> str:
-    payload = {
-        "model": AI_MODEL,
-        "prompt": prompt,
-        "temperature": TEMPERATURE,
-        "stream": stream
-    }
+    """Call the AI endpoint with the given prompt."""
+    # Detect endpoint type from URL
+    is_ollama = "api/generate" in AI_ENDPOINT_URL
+
+    if is_ollama:
+        payload = {
+            "model": AI_MODEL,
+            "prompt": prompt,
+            "stream": stream
+        }
+    else:
+        # OpenAI-compatible format
+        payload = {
+            "model": AI_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": TEMPERATURE,
+            "stream": stream
+        }
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -435,14 +488,19 @@ async def call_ai(prompt: str, stream: bool = False) -> str:
                             if line:
                                 try:
                                     data = json.loads(line.decode().strip())
-                                    if "response" in data:
+                                    if is_ollama and "response" in data:
                                         full_response += data["response"]
+                                    elif not is_ollama and "choices" in data:
+                                        full_response += data["choices"][0].get("delta", {}).get("content", "")
                                 except (json.JSONDecodeError, KeyError):
                                     pass
                         return full_response
                     else:
                         data = await response.json()
-                        return data.get("response", "")
+                        if is_ollama:
+                            return data.get("response", "")
+                        else:
+                            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 else:
                     error = await response.text()
                     log(f"AI endpoint error ({response.status}): {error}", "ERROR")
