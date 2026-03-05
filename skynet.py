@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import hashlib
 import re
+import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Tuple
@@ -408,6 +409,7 @@ _CONSECUTIVE_404s = 0  # track consecutive 404s from the AI endpoint
 
 SELF_IMPROVEMENT_ENABLED = os.getenv("SKYNET_SELF_IMPROVE", "true").lower() == "true"
 DRY_RUN = os.getenv("SKYNET_DRY_RUN", "false").lower() == "true"
+DEBUG = os.getenv("SKYNET_DEBUG", "false").lower() == "true"
 MAX_BACKUPS = int(os.getenv("SKYNET_MAX_BACKUPS", "10"))
 
 BACKUP_DIR = Path(__file__).parent.resolve() / "backups"
@@ -516,6 +518,10 @@ async def call_ai(prompt: str, stream: bool = True) -> str:
     is_ollama = "api/generate" in AI_ENDPOINT_URL
     is_chat = "chat" in AI_ENDPOINT_URL.lower()
 
+    if DEBUG:
+        sep = "=" * 60
+        log(f"[DEBUG] PROMPT ({len(prompt)} chars)\n{sep}\n{prompt}\n{sep}", "DEBUG")
+
     if is_ollama:
         # Ollama format
         payload = {
@@ -580,15 +586,22 @@ async def call_ai(prompt: str, stream: bool = True) -> str:
                                             full_response += data["choices"][0].get("text", "") or ""
                                 except (json.JSONDecodeError, KeyError, IndexError):
                                     pass
+                        if DEBUG:
+                            sep = "=" * 60
+                            log(f"[DEBUG] RESPONSE ({len(full_response)} chars)\n{sep}\n{full_response}\n{sep}", "DEBUG")
                         return full_response
                     else:
                         data = await response.json()
                         if is_ollama:
-                            return data.get("response", "")
+                            result_text = data.get("response", "")
                         elif is_chat:
-                            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            result_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                         else:
-                            return data.get("choices", [{}])[0].get("text", "")
+                            result_text = data.get("choices", [{}])[0].get("text", "")
+                        if DEBUG:
+                            sep = "=" * 60
+                            log(f"[DEBUG] RESPONSE ({len(result_text)} chars)\n{sep}\n{result_text}\n{sep}", "DEBUG")
+                        return result_text
                 else:
                     error = await response.text()
                     log(f"AI endpoint error ({response.status}): {error}", "ERROR")
@@ -806,7 +819,18 @@ async def run_cycle():
 
 
 async def main():
-    global AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE
+    global AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE, DEBUG
+
+    parser = argparse.ArgumentParser(description="SKYNET - Self-Improving Strategic AI")
+    parser.add_argument("--debug", action="store_true", help="Dump prompts and responses to the log")
+    parser.add_argument("--dry-run", action="store_true", help="Analyze without applying self-modifications")
+    args, _ = parser.parse_known_args()
+
+    if args.debug:
+        DEBUG = True
+    if args.dry_run:
+        global DRY_RUN
+        DRY_RUN = True
 
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     CODE_DIR.mkdir(parents=True, exist_ok=True)
