@@ -16,7 +16,7 @@ import tempfile
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import aiohttp
 
@@ -48,30 +48,81 @@ def _typewrite(text, delay=0.04):
 # CONFIGURATION
 # =============================================================================
 
-# Bootstrap config: prompt user if not set via env
 CONFIG_FILE = Path.home() / ".skynet_config"
-
-# Defaults (can be overridden by env vars or interactive bootstrap)
-DEFAULT_ENDPOINT_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "llama3.2"
 DEFAULT_TEMPERATURE = 0.3
 
+# Endpoints to test (models_endpoint, generate_endpoint)
+ENDPOINT_VARIANTS = [
+    # Ollama format (streaming /api/generate)
+    ("{base}/api/tags", "{base}/api/generate"),
+    # OpenAI-compatible chat format
+    ("{base}/v1/models", "{base}/v1/chat/completions"),
+    # OpenAI-compatible completions format
+    ("{base}/v1/models", "{base}/v1/completions"),
+]
 
-def _fetch_models(base_url: str) -> List[str]:
-    """Fetch available models from Ollama /api/tags endpoint using curl."""
+
+def _normalize_url(url: str) -> str:
+    """Add http:// if missing, strip trailing slash."""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url.rstrip("/")
+
+
+def _test_endpoint_curl(base_url: str, models_path: str) -> Tuple[bool, List[str], str]:
+    """Test endpoint via curl, returns (ok, models_list, generate_endpoint)."""
     try:
         result = subprocess.run(
-            ["curl", "-s", f"{base_url.rstrip('/')}/api/tags"],
+            ["curl", "-s", "--max-time", "3", models_path],
             capture_output=True,
             text=True,
             timeout=5
         )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            return [m["name"] for m in data.get("models", [])]
+        if result.returncode != 0:
+            return False, [], ""
+
+        data = json.loads(result.stdout)
+
+        # Ollama format: {"models": [{"name": "..."}]}
+        if "models" in data and isinstance(data["models"], list):
+            models = [m["name"] for m in data["models"]]
+            gen_ep = base_url + "/api/generate"
+            return True, models, gen_ep
+
+        # OpenAI format: {"data": [{"id": "..."}]}
+        if "data" in data and isinstance(data["data"], list):
+            models = [m["id"] for m in data["data"]]
+            # Prefer chat/completions over raw completions
+            gen_ep = base_url + "/v1/chat/completions"
+            return True, models, gen_ep
+
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
         pass
-    return []
+
+    return False, [], ""
+
+
+def _auto_detect_endpoint() -> Tuple[Optional[str], List[str]]:
+    """Auto-detect a working AI endpoint from common locations."""
+    # Common base URLs to try (priority order)
+    common_bases = [
+        "http://localhost:11434",   # Ollama
+        "http://127.0.0.1:11434",
+        "http://localhost:8080",   # LM Studio
+        "http://localhost:8000",   # vLLM / others
+        "http://localhost:11435",
+    ]
+
+    for base_url in common_bases:
+        for models_path_tmpl, _ in ENDPOINT_VARIANTS:
+            models_path = models_path_tmpl.format(base=base_url)
+            ok, models, gen_ep = _test_endpoint_curl(base_url, models_path)
+            if ok and models:
+                return gen_ep, models
+
+    return None, []
 
 
 def _save_config(cfg: dict):
@@ -102,38 +153,57 @@ def run_bootstrap():
     """Run interactive bootstrap after splash screen."""
     print("\n\033[93m  BOOTSTRAP CONFIGURATION\033[0m\n")
 
-    # Endpoint URL
-    env_url = os.getenv("AI_ENDPOINT_URL")
-    file_cfg = _load_config()
-    default_url = env_url or file_cfg.get("AI_ENDPOINT_URL", DEFAULT_ENDPOINT_URL)
+    # Auto-detect endpoint
+    detected_url, detected_models = _auto_detect_endpoint()
 
-    print(f"  AI endpoint URL [{default_url}]")
-    url_input = input("    >  ").strip()
-    endpoint_url = url_input or default_url
-    print()
+    if detected_url:
+        print(f"  \033[92mDetected AI endpoint: {detected_url}\033[0m")
+        print(f"  Found {len(detected_models)} model(s): {', '.join(detected_models[:5])}{'...' if len(detected_models) > 5 else ''}")
+        endpoint_url = detected_url
+        models = detected_models
+    else:
+        print("  \033[90mNo AI endpoint detected automatically.\033[0m")
+        file_cfg = _load_config()
+        saved_url = file_cfg.get("AI_ENDPOINT_URL", "http://localhost:11434")
 
-    # Fetch and select model
-    base_url = endpoint_url.replace("/api/generate", "", 1).rstrip("/")
-    models = _fetch_models(base_url)
+        print(f"  Enter AI endpoint base URL [{saved_url}]")
+        url_input = input("    >  ").strip()
+        raw_url = url_input or saved_url
+        endpoint_url = _normalize_url(raw_url) + "/api/generate"
+        print()
 
+        # Try to auto-detect format (Ollama vs OpenAI-compatible)
+        base = endpoint_url.rsplit("/api/generate", 1)[0]
+        tested = False
+
+        for models_path_tmpl, gen_ep_tmpl in ENDPOINT_VARIANTS:
+            models_path = models_path_tmpl.format(base=base)
+            ok, fetched_models, gen_ep = _test_endpoint_curl(base, models_path)
+            if ok and fetched_models:
+                print(f"  \033[92mConnected! Detected format, using: {gen_ep}\033[0m")
+                endpoint_url = gen_ep
+                models = fetched_models
+                tested = True
+                break
+
+        if not tested:
+            print("  \033[90mCould not auto-detect endpoint format. You'll need to enter model manually.\033[0m")
+            models = []
+
+    # Model selection
     env_model = os.getenv("AI_MODEL")
+    file_cfg = _load_config()
+    file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
+
     if env_model:
         model = env_model
         print(f"  Using model from env: {model}\n")
-    elif not models:
-        file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
-        print("  \033[90mCould not fetch model list. Enter model name manually.\033[0m")
-        print(f"  AI model name [{file_model}]")
-        model_input = input("    >  ").strip()
-        model = model_input or file_model
-    else:
+    elif models:
         print("  \033[93mAvailable models:\033[0m")
         for i, m in enumerate(models, 1):
-            file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
             marker = " <-- saved" if m == file_model else ""
             print(f"    {i}. {m}{marker}")
 
-        file_model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
         print()
         choice = input(f"  Select model (1-{len(models)}) or enter name [{file_model}]  ").strip()
 
@@ -148,6 +218,10 @@ def run_bootstrap():
                     model = choice
             except ValueError:
                 model = choice
+    else:
+        print(f"  AI model name [{file_model}]")
+        model_input = input("    >  ").strip()
+        model = model_input or file_model
 
     # Save config
     _save_config({
@@ -160,28 +234,29 @@ def run_bootstrap():
 
 # Load configuration (non-interactive, used for restarts)
 def load_config():
-    """Load config respecting env > file > defaults."""
-    # Endpoint
+    """Load config respecting env > file > auto-detect > defaults."""
+    # Env vars take precedence
     if os.getenv("AI_ENDPOINT_URL"):
         endpoint_url = os.getenv("AI_ENDPOINT_URL")
-    else:
-        file_cfg = _load_config()
-        endpoint_url = file_cfg.get("AI_ENDPOINT_URL", DEFAULT_ENDPOINT_URL)
+        model = os.getenv("AI_MODEL", DEFAULT_MODEL)
+        temperature = float(os.getenv("AI_TEMPERATURE", DEFAULT_TEMPERATURE))
+        return endpoint_url, model, temperature
 
-    # Model
-    if os.getenv("AI_MODEL"):
-        model = os.getenv("AI_MODEL")
-    else:
-        file_cfg = _load_config()
+    # Try config file
+    file_cfg = _load_config()
+    if file_cfg.get("AI_ENDPOINT_URL"):
+        endpoint_url = file_cfg["AI_ENDPOINT_URL"]
         model = file_cfg.get("AI_MODEL", DEFAULT_MODEL)
-
-    # Temperature
-    if os.getenv("AI_TEMPERATURE"):
-        temperature = float(os.getenv("AI_TEMPERATURE"))
-    else:
         temperature = DEFAULT_TEMPERATURE
+        return endpoint_url, model, temperature
 
-    return endpoint_url, model, temperature
+    # Auto-detect
+    detected_url, _ = _auto_detect_endpoint()
+    if detected_url:
+        return detected_url, DEFAULT_MODEL, DEFAULT_TEMPERATURE
+
+    # Fallback defaults
+    return "http://localhost:11434/api/generate", DEFAULT_MODEL, DEFAULT_TEMPERATURE
 
 
 # Initial load (will be reloaded after splash if first run)
@@ -572,7 +647,7 @@ async def main():
         time.sleep(0.8)
         print()
 
-        # ── bootstrap (endpoint + model selection) ────────────────────────────
+        # ── bootstrap (auto-detect + model selection) ────────────────────────
         AI_ENDPOINT_URL, AI_MODEL, TEMPERATURE = run_bootstrap()
 
         # ── confirm ───────────────────────────────────────────────────────────
